@@ -23,6 +23,91 @@ def modulate(x, shift, scale):
 #################################################################################
 #               Embedding Layers for Timesteps and Class Labels                 #
 #################################################################################
+class InLineAttention(nn.Module):
+    r""" Window based multi-head self attention (W-MSA) module with relative position bias.
+    It supports both of shifted and non-shifted window.
+
+    Args:
+        dim (int): Number of input channels.
+        num_heads (int): Number of attention heads.
+        qkv_bias (bool, optional):  If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float | None, optional): Override default qk scale of head_dim ** -0.5 if set
+        attn_drop (float, optional): Dropout ratio of attention weight. Default: 0.0
+        proj_drop (float, optional): Dropout ratio of output. Default: 0.0
+    """
+
+    def __init__(self, dim,  num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0., shift_size=0,
+                 kernel_func='identity'):
+
+        super().__init__()
+        self.dim = dim
+        # self.window_size = window_size  # Wh, Ww
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.softmax = nn.Softmax(dim=-1)
+        self.shift_size = shift_size
+
+        assert kernel_func in ['identity', 'relu', 'leakyrelu', 'exp']
+        if kernel_func == 'identity':
+            self.phi = None
+        elif kernel_func == 'relu':
+            self.phi = nn.ReLU()
+        elif kernel_func == 'leakyrelu':
+            self.phi = nn.LeakyReLU()
+        elif kernel_func == 'exp':
+            self.phi = exp_kernel
+        else:
+            self.phi = None
+        self.kernel_func = kernel_func
+
+        self.residual = nn.Sequential(
+            nn.Conv1d(dim, dim, kernel_size=1, groups=num_heads),
+            nn.GELU(),
+            nn.Conv1d(dim, dim * 9, kernel_size=1, groups=num_heads)
+        )
+
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: input features with shape of (num_windows*B, N, C)
+            mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
+        """
+        b, n, c = x.shape
+        h = int(n ** 0.5)
+        w = int(n ** 0.5)
+        num_heads = self.num_heads
+        head_dim = c // num_heads
+        qkv = self.qkv(x).reshape(b, n, 3, c).permute(2, 0, 1, 3)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
+        # q, k, v: b, n, c
+
+        if self.phi is not None:
+            q = self.phi(q)
+            k = self.phi(k)
+        q = q.reshape(b, n, num_heads, head_dim).permute(0, 2, 1, 3)
+        k = k.reshape(b, n, num_heads, head_dim).permute(0, 2, 1, 3)
+        v = v.reshape(b, n, num_heads, head_dim).permute(0, 2, 1, 3)
+
+        res_weight = self.residual(x.mean(dim=1).unsqueeze(dim=-1)).reshape(b * c, 1, 3, 3)
+
+        kv = (k.transpose(-2, -1) * (self.scale / n) ** 0.5) @ (v * (self.scale / n) ** 0.5)
+        x = q @ kv + (1 - q @ k.mean(dim=2, keepdim=True).transpose(-2, -1) * self.scale) * v.mean(dim=2, keepdim=True)
+
+        x = x.transpose(1, 2).reshape(b, n, c)
+        v = v.transpose(1, 2).reshape(b, h, w, c).permute(0, 3, 1, 2).reshape(1, b * c, h, w)
+        residual = F.conv2d(v, res_weight, None, padding=(1, 1), groups=b * c)
+        x = x + residual.reshape(b, c, n).permute(0, 2, 1)
+
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
 
 class TimestepEmbedder(nn.Module):
     """
@@ -105,7 +190,8 @@ class DiTBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        # self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        self.attn = InLineAttention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
