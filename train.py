@@ -145,6 +145,15 @@ def main(args):
     )
     # Note that parameter initialization is done within the DiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
+
+    if args.ckpt is not None:
+        ckpt_path = args.ckpt
+        state_dict = find_model(ckpt_path)
+        model.load_state_dict(state_dict["model"])
+        ema.load_state_dict(state_dict["ema"])
+        opt.load_state_dict(state_dict["opt"])
+        args = state_dict["args"]
+    
     requires_grad(ema, False)
     model = DDP(model.to(device), device_ids=[rank])
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
@@ -265,5 +274,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
+    parser.add_argument("--ckpt", type=str, default=None,
+                        help="Optional path to a custom DiT checkpoint")
     args = parser.parse_args()
     main(args)
